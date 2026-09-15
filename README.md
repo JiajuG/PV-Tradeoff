@@ -1,6 +1,201 @@
 # PV-Tradeoff
 
-This repository contains the pseudocode for the Pareto-constrained ecological-development co-optimization framework used to generate continuous photovoltaic development pathways.
+This repository provides the data and code needed to reproduce the Pareto-constrained ecological-development co-optimization framework.
+
+## Sentinel Data Processing Code on Google Earth Engine (GEE)
+
+To facilitate reproducibility, we provide the code used to process and download Sentinel data on the GEE platform.
+
+```javascript
+
+var ASSET_PV = 'projects/global-phenology/assets/RCR-PV-PV2020';
+var ASSET_BUFFER = 'projects/global-phenology/assets/RCR-BUFFER-PV2020';
+var ID_FIELD = '编号';
+
+var START_YEAR = 2017;
+var END_YEAR = 2023;
+var BUILD_YEAR = 2020;
+var SCALE = 10;
+var MIN_VALID_OBS = 5;
+var MAX_SCENE_CLOUD = 80;
+var PARALLEL_SCALE = 8;
+var TILE_SCALE = 16;
+var EXPORT_FOLDER = 'RCR_Sentinel2_PV2020_Yearly';
+
+var pv = ee.FeatureCollection(ASSET_PV);
+var buffer = ee.FeatureCollection(ASSET_BUFFER);
+var analysisRegion = buffer.geometry().bounds();
+
+print('PV feature count:', pv.size());
+print('Buffer feature count:', buffer.size());
+print('PV unique station IDs:', pv.aggregate_count_distinct(ID_FIELD));
+print('Buffer unique station IDs:', buffer.aggregate_count_distinct(ID_FIELD));
+
+Map.centerObject(pv, 4);
+Map.addLayer(pv, {color: 'red'}, 'PV', false);
+Map.addLayer(buffer, {color: 'blue'}, 'Buffer', false);
+
+// ============================================================
+// 1. Mask invalid observations and calculate NDVI/EVI
+// ============================================================
+
+function maskAndAddIndices(image) {
+  image = image.select(['B2', 'B4', 'B8', 'SCL']);
+
+  var scl = image.select('SCL');
+  var validMask = scl.neq(0)
+    .and(scl.neq(1))
+    .and(scl.neq(3))
+    .and(scl.neq(6))
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  var blue = image.select('B2').multiply(0.0001);
+  var red = image.select('B4').multiply(0.0001);
+  var nir = image.select('B8').multiply(0.0001);
+  var reflectanceMask = blue.gt(0).and(red.gt(0)).and(nir.gt(0));
+
+  var ndvi = nir.subtract(red).divide(nir.add(red))
+    .rename('NDVI')
+    .updateMask(nir.add(red).abs().gt(0.0001))
+    .updateMask(validMask)
+    .updateMask(reflectanceMask);
+
+  var eviDenominator = nir.add(red.multiply(6))
+    .subtract(blue.multiply(7.5)).add(1);
+
+  var evi = nir.subtract(red).multiply(2.5)
+    .divide(eviDenominator)
+    .rename('EVI')
+    .updateMask(eviDenominator.abs().gt(0.0001))
+    .updateMask(validMask)
+    .updateMask(reflectanceMask);
+
+  ndvi = ndvi.updateMask(ndvi.gte(-1).and(ndvi.lte(1)));
+  evi = evi.updateMask(evi.gte(-1).and(evi.lte(1.5)));
+
+  return ee.Image.cat([ndvi, evi])
+    .copyProperties(image, ['system:time_start', 'system:index']);
+}
+
+// ============================================================
+// 2. Pixel-wise annual maximum
+// ============================================================
+
+function makeAnnualTmax(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end = start.advance(1, 'year');
+
+  var collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(analysisRegion)
+    .filterDate(start, end)
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', MAX_SCENE_CLOUD))
+    .select(['B2', 'B4', 'B8', 'SCL'])
+    .map(maskAndAddIndices);
+
+  var temporalReducer = ee.Reducer.max().combine({
+    reducer2: ee.Reducer.count(),
+    sharedInputs: true
+  });
+
+  var annualStats = collection.select(['NDVI', 'EVI'])
+    .reduce(temporalReducer, PARALLEL_SCALE);
+
+  var ndviCount = annualStats.select('NDVI_count');
+  var eviCount = annualStats.select('EVI_count');
+
+  var ndviTmax = annualStats.select('NDVI_max')
+    .rename('NDVI_Tmax')
+    .updateMask(ndviCount.gte(MIN_VALID_OBS));
+
+  var eviTmax = annualStats.select('EVI_max')
+    .rename('EVI_Tmax')
+    .updateMask(eviCount.gte(MIN_VALID_OBS));
+
+  return ee.Image.cat([ndviTmax, eviTmax]).set({
+    year: year,
+    relative_year: year - BUILD_YEAR,
+    source_image_count: collection.size()
+  });
+}
+
+// ============================================================
+// 3. Polygon spatial mean, median and valid pixel count
+// ============================================================
+
+var spatialReducer = ee.Reducer.mean()
+  .combine({
+    reducer2: ee.Reducer.median(),
+    sharedInputs: true
+  })
+  .combine({
+    reducer2: ee.Reducer.count(),
+    sharedInputs: true
+  });
+
+function reduceZone(annualImage, features, zoneType, year) {
+  return annualImage.reduceRegions({
+    collection: features,
+    reducer: spatialReducer,
+    scale: SCALE,
+    tileScale: TILE_SCALE,
+    maxPixelsPerRegion: 1e8
+  }).map(function(feature) {
+    return feature.set({
+      construction_year: BUILD_YEAR,
+      year: year,
+      relative_year: year - BUILD_YEAR,
+      zone_type: zoneType,
+      source_image_count: annualImage.get('source_image_count'),
+      min_valid_observations: MIN_VALID_OBS,
+      temporal_method: 'pixelwise_annual_maximum',
+      spatial_method: 'polygon_mean_median_count',
+      spatial_scale_m: SCALE
+    }).setGeometry(null);
+  });
+}
+
+var selectors = [
+  ID_FIELD,
+  'construction_year',
+  'year',
+  'relative_year',
+  'zone_type',
+  'NDVI_Tmax_mean',
+  'NDVI_Tmax_median',
+  'NDVI_Tmax_count',
+  'EVI_Tmax_mean',
+  'EVI_Tmax_median',
+  'EVI_Tmax_count',
+  'source_image_count',
+  'min_valid_observations',
+  'temporal_method',
+  'spatial_method',
+  'spatial_scale_m'
+];
+
+// ============================================================
+// 4. Create seven independent yearly export tasks
+// ============================================================
+
+for (var year = START_YEAR; year <= END_YEAR; year++) {
+  var annualImage = makeAnnualTmax(year);
+  var pvTable = reduceZone(annualImage, pv, 'PV', year);
+  var bufferTable = reduceZone(annualImage, buffer, 'BUFFER', year);
+  var yearlyTable = pvTable.merge(bufferTable);
+
+  Export.table.toDrive({
+    collection: yearlyTable,
+    description: 'RCR_S2_Tmax_PV_BUFFER_' + year,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: 'RCR_S2_Tmax_PV_BUFFER_' + year,
+    fileFormat: 'CSV',
+    selectors: selectors
+  });
+}
+```
 
 ## Pareto-Constrained Optimization of PV Layouts
 
