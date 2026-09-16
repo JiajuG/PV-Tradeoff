@@ -5,6 +5,8 @@ This repository provides the data and code needed to reproduce the Pareto-constr
 ## Sentinel Data Processing Code on Google Earth Engine (GEE)
 
 To facilitate reproducibility, we provide the code used to process and download Sentinel data on the GEE platform.
+<img width="1430" height="744" alt="image" src="https://github.com/user-attachments/assets/f6c58d96-2f47-4c67-bac2-1b3658d1aef3" />
+
 
 ```javascript
 
