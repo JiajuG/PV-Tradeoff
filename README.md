@@ -1,6 +1,6 @@
 # PV-Tradeoff
 
-This repository provides the data and code needed to reproduce the Pareto-constrained ecological-development co-optimization framework.
+This repository provides supplementary information related to Sentinel-2 processing on Google Earth Engine, the MaxEnt suitability model, and the Pareto-constrained ecological-development co-optimization framework used in this study.
 
 ## Sentinel Data Processing Code on Google Earth Engine (GEE)
 
